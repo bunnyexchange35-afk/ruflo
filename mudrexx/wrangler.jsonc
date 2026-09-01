@@ -1,0 +1,48 @@
+{
+  // MUDREXX backend — Cloudflare Worker + D1 (§9).
+  //
+  // IMPORTANT: the local dev/miniflare database is NOT production.
+  // `database_id` below must be the id of the real production D1 database
+  // (`npx wrangler d1 list`). It is an identifier, not a credential.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mudrexx-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mudrexx_db",
+      // TODO(provision): replace with the real production D1 id before deploy.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "vars": {
+    "ENVIRONMENT": "production",
+    "LLM_PROVIDER_ORDER": "openai,anthropic,openrouter,google,ollama",
+    "ALLOWED_ORIGINS": ""
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  "env": {
+    "staging": {
+      "vars": {
+        "ENVIRONMENT": "staging"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "mudrexx_db_staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations"
+        }
+      ]
+    }
+  }
+}
