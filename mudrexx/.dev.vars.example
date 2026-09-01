@@ -1,0 +1,40 @@
+# Local development secrets — copy to `.dev.vars` (gitignored) and fill in.
+# NEVER commit real values. `wrangler secret put <NAME>` sets them in production.
+
+# §21 Emergency recovery. Required before any recovery code can be minted.
+# Rotate with RECOVERY_ROTATION_ID to invalidate all outstanding challenges.
+RECOVERY_SECRET=
+RECOVERY_ROTATION_ID=rot-1
+
+# §27 LLM providers — set at least one to enable real AI responses.
+# With none configured, /api/ai/* fails with PROVIDER_NOT_CONFIGURED (never fakes).
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+ANTHROPIC_API_KEY=
+ANTHROPIC_MODEL=claude-sonnet-4-5
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=openai/gpt-4o-mini
+GOOGLE_API_KEY=
+GOOGLE_MODEL=gemini-2.0-flash
+# Ollama needs no key — set the base URL to enable it.
+OLLAMA_BASE_URL=
+OLLAMA_MODEL=llama3.1
+LLM_PROVIDER_ORDER=openai,anthropic,openrouter,google,ollama
+
+# §31 WhatsApp provider (meta_cloud_api or twilio).
+WHATSAPP_PROVIDER=
+WHATSAPP_ACCESS_TOKEN=
+WHATSAPP_PHONE_NUMBER_ID=
+WHATSAPP_API_VERSION=v21.0
+WHATSAPP_WEBHOOK_SECRET=
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_WHATSAPP_FROM=
+
+# §32 Destinations. The token is referenced by NAME from the destinations table
+# and is never returned by any API response.
+TELEGRAM_BOT_TOKEN=
+WEBHOOK_DELIVERY_SECRET=
+
+# CORS allowlist for /api/* (comma separated). Empty = reflect request origin.
+ALLOWED_ORIGINS=http://localhost:5173

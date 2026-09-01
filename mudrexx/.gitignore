@@ -1,0 +1,15 @@
+# Wrangler local state (contains simulated D1 data — never commit)
+.wrangler/
+
+# Local secrets
+.dev.vars
+.env
+.env.local
+.env.production
+!.dev.vars.example
+
+# Build / test output
+dist/
+coverage/
+*.tsbuildinfo
+node_modules/
