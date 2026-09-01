@@ -1,0 +1,172 @@
+# ============================================================================
+# MUDREXX — rollback  (§12)
+#
+# Rolls the Worker back to a previous known-good version using Cloudflare's own
+# supported version-rollback mechanism (`wrangler rollback`), then re-runs the
+# production health check against the rolled-back deployment.
+#
+# This workflow NEVER touches the database. A failed code deployment is fixed by
+# rolling the code back — not by mutating or dropping production data. If a
+# rollback would require a schema change, stop and handle it manually.
+# ============================================================================
+name: MUDREXX Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to roll back'
+        type: choice
+        options: [production, staging]
+        default: production
+      version_id:
+        description: 'Version ID to roll back to (leave empty to roll back to the previous version)'
+        type: string
+        required: false
+      reason:
+        description: 'Why are you rolling back? (recorded in the run log)'
+        type: string
+        required: true
+
+defaults:
+  run:
+    working-directory: mudrexx
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: mudrexx-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Roll back ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    env:
+      TARGET_ENV: ${{ github.event.inputs.environment }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: mudrexx/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Record the reason
+        env:
+          ROLLBACK_REASON: ${{ github.event.inputs.reason }}
+        run: |
+          echo "Rollback reason: $ROLLBACK_REASON"
+
+      # ---- 1. identify the previous known-good deployment/version ----
+      - name: List deployed versions
+        id: versions
+        run: |
+          set -o pipefail
+          if [ "$TARGET_ENV" = "production" ]; then
+            npx wrangler deployments list 2>&1 | tee /tmp/versions.log || true
+            npx wrangler versions list 2>&1 | tee -a /tmp/versions.log || true
+          else
+            npx wrangler deployments list --env "$TARGET_ENV" 2>&1 | tee /tmp/versions.log || true
+            npx wrangler versions list --env "$TARGET_ENV" 2>&1 | tee -a /tmp/versions.log || true
+          fi
+          {
+            echo "### Versions available for rollback (\`$TARGET_ENV\`)"
+            echo ''
+            echo '```'
+            cat /tmp/versions.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- 2. roll back using Cloudflare's supported mechanism ----
+      - name: Roll back the Worker
+        id: rollback
+        env:
+          # Passed through the environment, never interpolated into the shell.
+          VERSION: ${{ github.event.inputs.version_id }}
+          ROLLBACK_REASON: ${{ github.event.inputs.reason }}
+        run: |
+          set -o pipefail
+          MSG="Automated rollback: $ROLLBACK_REASON"
+          if [ "$TARGET_ENV" = "production" ]; then
+            if [ -n "$VERSION" ]; then
+              npx wrangler rollback "$VERSION" --message "$MSG" --yes 2>&1 | tee /tmp/rollback.log
+            else
+              npx wrangler rollback --message "$MSG" --yes 2>&1 | tee /tmp/rollback.log
+            fi
+          else
+            if [ -n "$VERSION" ]; then
+              npx wrangler rollback "$VERSION" --env "$TARGET_ENV" --message "$MSG" --yes 2>&1 | tee /tmp/rollback.log
+            else
+              npx wrangler rollback --env "$TARGET_ENV" --message "$MSG" --yes 2>&1 | tee /tmp/rollback.log
+            fi
+          fi
+          active=$(grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' /tmp/rollback.log | tail -1 || true)
+          echo "version=${active:-$VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the deployment URL
+        id: url
+        run: |
+          url=""
+          if [ "$TARGET_ENV" = "production" ]; then url="${{ vars.MUDREXX_PRODUCTION_URL }}"; else url="${{ vars.MUDREXX_STAGING_URL }}"; fi
+          if [ -z "$url" ]; then
+            url=$(grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' /tmp/rollback.log | tail -1 || true)
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      # ---- 3. verify the rolled-back deployment is actually healthy ----
+      - name: Health check after rollback
+        id: health
+        if: steps.url.outputs.url != ''
+        continue-on-error: true
+        run: |
+          node scripts/ci/health-check.mjs \
+            --base-url "${{ steps.url.outputs.url }}" \
+            --expect-environment "$TARGET_ENV" \
+            --out artifacts/health.json
+
+      - name: Record ROLLBACK result
+        if: always()
+        env:
+          ROLLBACK_REASON: ${{ github.event.inputs.reason }}
+        run: |
+          node scripts/ci/record-stage.mjs --stage deployment --title "Rollback (wrangler rollback)" \
+            --status "${{ steps.rollback.outcome }}" \
+            --detail "version=${{ steps.rollback.outputs.version }} reason=$ROLLBACK_REASON" \
+            --out artifacts/deployment.json
+          node scripts/ci/record-stage.mjs --stage build --title "Build" --status skipped --detail "not rebuilt — rolling back to an already-built version" --out artifacts/build.json
+          node scripts/ci/record-stage.mjs --stage test --title "Tests" --status skipped --detail "not re-run — rolling back to a previously tested version" --out artifacts/test.json
+          node scripts/ci/record-stage.mjs --stage database --title "Database" --status skipped --detail "intentionally untouched — a rollback never mutates production data (§12)" --out artifacts/database.json
+
+      - name: Rollback result
+        if: always()
+        run: |
+          if [ "$TARGET_ENV" = "production" ]; then WORKER="mudrexx-backend"; else WORKER="mudrexx-backend-$TARGET_ENV"; fi
+          node scripts/ci/report.mjs \
+            --dir artifacts \
+            --required deployment,health \
+            --commit "${{ github.sha }}" \
+            --worker "$WORKER" \
+            --version-id "${{ steps.rollback.outputs.version }}" \
+            --url "${{ steps.url.outputs.url }}" \
+            --environment "$TARGET_ENV" \
+            --out artifacts/rollback-result.json
+
+      - name: Upload rollback report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mudrexx-rollback-report-${{ github.run_id }}
+          path: mudrexx/artifacts/
+          retention-days: 30

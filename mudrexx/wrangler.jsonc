@@ -30,15 +30,53 @@
     "enabled": true
   },
 
+  // §6 Environment separation.
+  //
+  // The TOP-LEVEL block above is the PRODUCTION environment (wrangler's default
+  // environment). `env.staging` and `env.development` are fully separate
+  // deployments: separate Worker name, separate D1 database, separate secrets.
+  //
+  //   production   npx wrangler deploy                     -> mudrexx-backend
+  //   staging      npx wrangler deploy --env staging       -> mudrexx-backend-staging
+  //   development  npx wrangler dev                        -> local miniflare + --local D1
+  //
+  // Staging configuration can never reach production: the deploy pipeline runs
+  // `scripts/ci/check-config.mjs --target production`, which asserts that
+  // vars.ENVIRONMENT === "production" and that the bound D1 database is not a
+  // staging/dev database.
   "env": {
     "staging": {
       "vars": {
-        "ENVIRONMENT": "staging"
+        "ENVIRONMENT": "staging",
+        "LLM_PROVIDER_ORDER": "openai,anthropic,openrouter,google,ollama",
+        "ALLOWED_ORIGINS": ""
+      },
+      "observability": {
+        "enabled": true
       },
       "d1_databases": [
         {
           "binding": "DB",
           "database_name": "mudrexx_db_staging",
+          // TODO(provision): replace with the real staging D1 id before deploying to staging.
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations"
+        }
+      ]
+    },
+
+    "development": {
+      "vars": {
+        "ENVIRONMENT": "development",
+        "LLM_PROVIDER_ORDER": "openai,anthropic,openrouter,google,ollama",
+        "ALLOWED_ORIGINS": "http://localhost:5173"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "mudrexx_db_dev",
+          // Local development uses miniflare's simulated D1 (`--local`), where
+          // this id is not used. Provision a real dev D1 only if you deploy it.
           "database_id": "00000000-0000-0000-0000-000000000000",
           "migrations_dir": "migrations"
         }

@@ -1,0 +1,408 @@
+# ============================================================================
+# MUDREXX — automatic Cloudflare build + deployment
+#
+#   CODE PUSH → BUILD → TYPECHECK → TEST → DATABASE/SCHEMA CHECK →
+#   CLOUDFLARE DEPLOY → PRODUCTION HEALTH CHECK → SMOKE TEST →
+#   DEPLOYMENT RESULT
+#
+# Deployment rule (§13):
+#   main + all checks passing  → production deployment (automatic)
+#   feature branches           → build + test only
+#   pull requests              → build + test only (plus review)
+#
+# Authentication (§2): every Cloudflare credential comes from GitHub Actions
+# secrets bound to a GitHub Environment. Nothing credential-shaped is ever
+# committed to this repository, echoed to a log or written to wrangler vars.
+# ============================================================================
+name: MUDREXX Deploy
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'mudrexx/**'
+      - '.github/workflows/mudrexx-deploy.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'mudrexx/**'
+      - '.github/workflows/mudrexx-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [production, staging]
+        default: staging
+      apply_migrations:
+        description: 'Apply pending (non-destructive) migrations'
+        type: boolean
+        default: false
+
+defaults:
+  run:
+    working-directory: mudrexx
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  # Never run two deploys at the same target at once, and never cancel a
+  # production deploy that is already in flight.
+  group: mudrexx-${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'production' || github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ==========================================================================
+  # BUILD + TYPECHECK
+  # ==========================================================================
+  build:
+    name: Build & typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mudrexx/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Build / typecheck (tsc --noEmit)
+        run: npm run build
+
+      - name: Verify the worker bundles for the target environment
+        # `--dry-run` runs the real esbuild bundling wrangler would do at deploy
+        # time, without contacting Cloudflare and without any credentials.
+        run: |
+          if [ "${{ github.event.inputs.environment || 'production' }}" = "production" ]; then
+            npx wrangler deploy --dry-run --outdir /tmp/mudrexx-build
+          else
+            npx wrangler deploy --dry-run --env "${{ github.event.inputs.environment }}" --outdir /tmp/mudrexx-build
+          fi
+
+  # ==========================================================================
+  # TEST
+  # ==========================================================================
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mudrexx/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Run tests (workerd + real D1)
+        run: npm test
+
+  # ==========================================================================
+  # CONFIGURATION + MIGRATION VALIDATION
+  # Runs on every branch and PR: catches a broken wrangler config or a
+  # destructive migration long before it can reach production.
+  # ==========================================================================
+  validate:
+    name: Config & migration validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Validate migrations are non-destructive (§4)
+        # Static validation only — no credentials, D1 is never contacted here.
+        run: node scripts/ci/check-migrations.mjs --target production --offline --out /tmp/validate/database.json
+
+      - name: Report wrangler configuration state (non-blocking on CI branches)
+        # Informational on branches/PRs. The deploy job runs the same guard as a
+        # hard gate, so an unprovisioned D1 id can never reach production.
+        continue-on-error: true
+        run: node scripts/ci/check-config.mjs --target production --out /tmp/validate/config.json
+
+  # ==========================================================================
+  # DEPLOY  (production: main only — §13)
+  #
+  # This single job runs the ordered chain so every stage shares the same
+  # artifacts directory and the final report can be assembled from real data:
+  #   config guard → database/schema check → wrangler deploy →
+  #   health check → read-only smoke → deployment result
+  # ==========================================================================
+  deploy:
+    name: Deploy to Cloudflare (${{ github.event.inputs.environment || 'production' }})
+    needs: [build, test, validate]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # GitHub Environment: holds the Cloudflare + smoke secrets and any required
+    # reviewers. "Approved push" = the environment's protection rules.
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      TARGET_ENV: ${{ github.event.inputs.environment || 'production' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mudrexx/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      # ---- record the gates that already passed, from their REAL outcomes ----
+      - name: Record BUILD result
+        run: node scripts/ci/record-stage.mjs --stage build --title "Build & typecheck" --status "${{ needs.build.result }}" --detail "npm ci + tsc --noEmit + wrangler dry-run bundle" --out artifacts/build.json
+
+      - name: Record TEST result
+        run: node scripts/ci/record-stage.mjs --stage test --title "Test suite" --status "${{ needs.test.result }}" --detail "vitest run (workerd + D1)" --out artifacts/test.json
+
+      # ------------------------- 1. config guard -------------------------
+      # Hard gate. Fails the deploy if the worker/D1/env config is incoherent
+      # or still contains an unprovisioned placeholder id (§5, §6).
+      - name: Configuration guard
+        run: node scripts/ci/check-config.mjs --target "$TARGET_ENV" --require-credentials --out artifacts/config.json
+
+      # ---------------- 2. worker secrets (never committed) ----------------
+      - name: Sync Worker secrets from GitHub secrets
+        if: vars.SYNC_WORKER_SECRETS == 'true'
+        env:
+          RECOVERY_SECRET: ${{ secrets.RECOVERY_SECRET }}
+          RECOVERY_ROTATION_ID: ${{ secrets.RECOVERY_ROTATION_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          WHATSAPP_ACCESS_TOKEN: ${{ secrets.WHATSAPP_ACCESS_TOKEN }}
+          WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+          WHATSAPP_WEBHOOK_SECRET: ${{ secrets.WHATSAPP_WEBHOOK_SECRET }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          WEBHOOK_DELIVERY_SECRET: ${{ secrets.WEBHOOK_DELIVERY_SECRET }}
+        run: |
+          # Builds the bulk-secret payload in a subshell and pipes it straight
+          # into wrangler. Values are never printed, never written to disk.
+          set -euo pipefail
+          names="RECOVERY_SECRET RECOVERY_ROTATION_ID OPENAI_API_KEY ANTHROPIC_API_KEY \
+                 OPENROUTER_API_KEY GOOGLE_API_KEY WHATSAPP_ACCESS_TOKEN WHATSAPP_PHONE_NUMBER_ID \
+                 WHATSAPP_WEBHOOK_SECRET TWILIO_ACCOUNT_SID TWILIO_AUTH_TOKEN TWILIO_WHATSAPP_FROM \
+                 TELEGRAM_BOT_TOKEN WEBHOOK_DELIVERY_SECRET"
+          present=""
+          for n in $names; do
+            if [ -n "${!n:-}" ]; then present="$present $n"; fi
+          done
+          if [ -z "$present" ]; then
+            echo "No worker secrets configured in this environment — skipping."
+            exit 0
+          fi
+          echo "Syncing secrets (names only):$present"
+          payload=$(for n in $present; do printf '%s\n' "$n"; printf '%s\0' "${!n}"; done \
+            | node -e '
+              const chunks = [];
+              process.stdin.on("data", (d) => chunks.push(d));
+              process.stdin.on("end", () => {
+                const buf = Buffer.concat(chunks).toString("utf8");
+                const out = {};
+                for (const part of buf.split("\0")) {
+                  if (!part.length) continue;
+                  const nl = part.indexOf("\n");
+                  out[part.slice(0, nl).trim()] = part.slice(nl + 1);
+                }
+                process.stdout.write(JSON.stringify(out));
+              });
+            ')
+          if [ "$TARGET_ENV" = "production" ]; then
+            printf '%s' "$payload" | npx wrangler secret bulk
+          else
+            printf '%s' "$payload" | npx wrangler secret bulk --env "$TARGET_ENV"
+          fi
+
+      # -------------------- 3. DATABASE / SCHEMA CHECK --------------------
+      # Detect → validate → (only if approved) apply → verify. Destructive
+      # migrations are refused outright and never run automatically (§4).
+      - name: Database / schema check
+        run: |
+          if [ "${{ github.event.inputs.apply_migrations }}" = "true" ] || [ "${{ vars.APPLY_MIGRATIONS }}" = "true" ]; then
+            node scripts/ci/check-migrations.mjs --target "$TARGET_ENV" --apply --out artifacts/database.json
+          else
+            node scripts/ci/check-migrations.mjs --target "$TARGET_ENV" --out artifacts/database.json
+          fi
+
+      # ------------------------ 4. CLOUDFLARE DEPLOY ------------------------
+      - name: Deploy Worker
+        id: deploy
+        run: |
+          set -o pipefail
+          if [ "$TARGET_ENV" = "production" ]; then
+            npx wrangler deploy 2>&1 | tee /tmp/deploy.log
+          else
+            npx wrangler deploy --env "$TARGET_ENV" 2>&1 | tee /tmp/deploy.log
+          fi
+
+          # Read the worker name from the REAL config — never invented.
+          worker=$(node --input-type=module -e "
+            import { readJsonc } from './scripts/ci/lib.mjs';
+            const c = readJsonc('./wrangler.jsonc');
+            const t = process.env.TARGET_ENV;
+            const e = t === 'production' ? c : (c.env ?? {})[t] ?? {};
+            console.log(e.name ?? (t === 'production' ? c.name : \`\${c.name}-\${t}\`));
+          ")
+
+          # Version id and URL come from wrangler's own output — not invented.
+          version=$(grep -oiE 'Current Version ID:[[:space:]]*[0-9a-fA-F-]+' /tmp/deploy.log | tail -1 | awk '{print $NF}')
+          if [ -z "$version" ]; then
+            version=$(grep -oiE 'Current Deployment ID:[[:space:]]*[0-9a-fA-F-]+' /tmp/deploy.log | tail -1 | awk '{print $NF}')
+          fi
+          url=$(grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' /tmp/deploy.log | tail -1 || true)
+          # A custom route/domain declared in wrangler.jsonc wins over workers.dev.
+          if [ -z "$url" ]; then
+            url=$(node --input-type=module -e "
+              import { readJsonc } from './scripts/ci/lib.mjs';
+              const c = readJsonc('./wrangler.jsonc');
+              const t = process.env.TARGET_ENV;
+              const e = t === 'production' ? c : (c.env ?? {})[t] ?? {};
+              const r = e.routes ?? e.route ?? c.routes ?? c.route;
+              const first = Array.isArray(r) ? r[0] : r;
+              const pattern = typeof first === 'string' ? first : first?.pattern;
+              console.log(pattern ? 'https://' + String(pattern).replace(/^https?:\/\//, '').replace(/\/\*?$/, '') : '');
+            ")
+          fi
+          # An explicitly configured URL always wins (custom domain in front of the worker).
+          if [ "$TARGET_ENV" = "production" ] && [ -n "${{ vars.MUDREXX_PRODUCTION_URL }}" ]; then url="${{ vars.MUDREXX_PRODUCTION_URL }}"; fi
+          if [ "$TARGET_ENV" = "staging" ]    && [ -n "${{ vars.MUDREXX_STAGING_URL }}" ];    then url="${{ vars.MUDREXX_STAGING_URL }}"; fi
+
+          if [ -z "$url" ]; then
+            echo "::error::Could not determine the deployed URL from wrangler output or wrangler.jsonc."
+            echo "::error::Set the repository/environment variable MUDREXX_PRODUCTION_URL (or MUDREXX_STAGING_URL)"
+            echo "::error::so the health check and smoke tests can verify the real deployment."
+            exit 1
+          fi
+
+          echo "worker=$worker"   >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "url=$url"         >> "$GITHUB_OUTPUT"
+          echo "Deployed worker=$worker version=${version:-unreported} url=$url"
+
+      - name: Record DEPLOYMENT result
+        if: always()
+        run: |
+          node scripts/ci/record-stage.mjs \
+            --stage deployment --title "Cloudflare deploy" \
+            --status "${{ steps.deploy.outcome }}" \
+            --detail "worker=${{ steps.deploy.outputs.worker }} version=${{ steps.deploy.outputs.version }} url=${{ steps.deploy.outputs.url }}" \
+            --out artifacts/deployment.json
+
+      - name: Fail fast if the deployment did not succeed
+        if: steps.deploy.outcome != 'success'
+        run: |
+          echo "::error::Cloudflare deployment failed — skipping verification. This deployment is NOT successful."
+          exit 1
+
+      # --------------------- 5. PRODUCTION HEALTH CHECK ---------------------
+      - name: Health check
+        id: health
+        continue-on-error: true
+        run: |
+          node scripts/ci/health-check.mjs \
+            --base-url "${{ steps.deploy.outputs.url }}" \
+            --expect-environment "$TARGET_ENV" \
+            --out artifacts/health.json
+
+      # ------------------- 6. SMOKE TEST (read-only, §8-10) -------------------
+      - name: Read-only smoke test (auth / CRM / AI)
+        id: smoke
+        continue-on-error: true
+        env:
+          SMOKE_USER_EMAIL: ${{ secrets.SMOKE_USER_EMAIL }}
+          SMOKE_USER_PASSWORD: ${{ secrets.SMOKE_USER_PASSWORD }}
+          SMOKE_ADMIN_EMAIL: ${{ secrets.SMOKE_ADMIN_EMAIL }}
+          SMOKE_ADMIN_PASSWORD: ${{ secrets.SMOKE_ADMIN_PASSWORD }}
+          SMOKE_CHIEF_EMAIL: ${{ secrets.SMOKE_CHIEF_EMAIL }}
+          SMOKE_CHIEF_PASSWORD: ${{ secrets.SMOKE_CHIEF_PASSWORD }}
+          SMOKE_REQUIRE_LLM: ${{ vars.SMOKE_REQUIRE_LLM || 'true' }}
+          # Writes stay off unless a maintainer explicitly enables them.
+          SMOKE_ALLOW_WRITES: ${{ vars.SMOKE_ALLOW_WRITES || 'false' }}
+        run: |
+          node scripts/ci/smoke-readonly.mjs \
+            --base-url "${{ steps.deploy.outputs.url }}" \
+            --out-dir artifacts
+
+      # ------------------------ 7. DEPLOYMENT RESULT ------------------------
+      - name: Deployment result
+        if: always()
+        run: |
+          node scripts/ci/report.mjs \
+            --dir artifacts \
+            --commit "${{ github.sha }}" \
+            --worker "${{ steps.deploy.outputs.worker }}" \
+            --version-id "${{ steps.deploy.outputs.version }}" \
+            --url "${{ steps.deploy.outputs.url }}" \
+            --environment "$TARGET_ENV" \
+            --out artifacts/deployment-result.json
+
+      - name: Upload deployment report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mudrexx-deployment-report-${{ github.run_id }}
+          path: mudrexx/artifacts/
+          retention-days: 30
+
+      - name: Rollback hint on failure
+        if: failure()
+        run: |
+          echo "::error::MUDREXX deployment verification FAILED. Do not treat this release as deployed."
+          echo "To roll back to the previous known-good version, run the 'MUDREXX Rollback' workflow"
+          echo "(.github/workflows/mudrexx-rollback.yml). It uses Cloudflare's own version rollback"
+          echo "and never touches the database."
+
+  # ==========================================================================
+  # Feature branches / pull requests: build + test only (§13)
+  # ==========================================================================
+  no-deploy:
+    name: Build + test only (no deployment)
+    needs: [build, test, validate]
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise
+        working-directory: .
+        run: |
+          {
+            echo "## MUDREXX — build + test only"
+            echo ""
+            echo "| Stage | Status |"
+            echo "| --- | --- |"
+            echo "| BUILD | ${{ needs.build.result == 'success' && '✅ PASS' || '❌ FAIL' }} |"
+            echo "| TEST | ${{ needs.test.result == 'success' && '✅ PASS' || '❌ FAIL' }} |"
+            echo "| VALIDATE | ${{ needs.validate.result == 'success' && '✅ PASS' || '❌ FAIL' }} |"
+            echo "| DEPLOYMENT | ➖ NOT RUN (production deploys only from \`main\`) |"
+            echo ""
+            echo "Ref \`${{ github.ref }}\` is not the production branch, so no Cloudflare deployment was performed."
+          } >> "$GITHUB_STEP_SUMMARY"

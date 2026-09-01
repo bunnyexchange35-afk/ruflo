@@ -177,6 +177,21 @@ After deploy, as Chief: `POST /api/ai/skills/seed`, then `POST /api/auth/demo`.
 > **Destructive migrations:** `scripts/seed.mjs` and the npm scripts only apply
 > additive migrations. Nothing here drops tables or deletes users (§58).
 
+### Automatic deployment
+
+Pushes to `main` deploy to Cloudflare automatically through
+`.github/workflows/mudrexx-deploy.yml`:
+
+```
+BUILD → TYPECHECK → TEST → DATABASE/SCHEMA CHECK → CLOUDFLARE DEPLOY
+      → HEALTH CHECK → READ-ONLY SMOKE TEST → DEPLOYMENT RESULT
+```
+
+Feature branches and pull requests run build + test only. See
+**[DEPLOYMENT.md](./DEPLOYMENT.md)** for the required GitHub secrets, the
+development/staging/production separation, the migration safety gate and the
+rollback procedure.
+
 ---
 
 ## 6. Testing

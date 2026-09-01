@@ -13,3 +13,6 @@ dist/
 coverage/
 *.tsbuildinfo
 node_modules/
+
+# CI/CD stage reports produced by scripts/ci/* (regenerated every run)
+artifacts/
