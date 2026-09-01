@@ -5,14 +5,16 @@ import { Dashboard } from './pages/Dashboard';
 import { Admins } from './pages/Admins';
 import { Payments } from './pages/Payments';
 import { Security } from './pages/Security';
+import { ControlPlane } from './pages/ControlPlane';
 
-type Page = 'dashboard' | 'admins' | 'payments' | 'security';
+type Page = 'dashboard' | 'admins' | 'payments' | 'security' | 'controlplane';
 
 const PAGES: { id: Page; label: string }[] = [
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'admins', label: 'Admins' },
   { id: 'payments', label: 'Payments' },
   { id: 'security', label: 'Security' },
+  { id: 'controlplane', label: 'Control plane' },
 ];
 
 export function App() {
@@ -95,6 +97,7 @@ export function App() {
         {page === 'admins' && <Admins />}
         {page === 'payments' && <Payments />}
         {page === 'security' && <Security />}
+        {page === 'controlplane' && <ControlPlane />}
       </main>
     </div>
   );

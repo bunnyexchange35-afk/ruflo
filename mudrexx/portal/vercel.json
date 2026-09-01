@@ -1,9 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": null,
-  "installCommand": "npm --prefix mudrexx/portal ci || npm --prefix mudrexx/portal install",
-  "buildCommand": "npm --prefix mudrexx/portal run build",
-  "outputDirectory": "mudrexx/portal/dist",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
   "rewrites": [
     {
       "source": "/((?!api/).*)",
