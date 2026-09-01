@@ -10,13 +10,21 @@
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
+    "dry-run": "wrangler deploy --dry-run --outdir dist",
     "db:migrate:local": "wrangler d1 migrations apply mudrexx_db --local",
     "db:migrate:remote": "wrangler d1 migrations apply mudrexx_db --remote",
     "db:list": "wrangler d1 list",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:unit": "vitest run tests/unit",
-    "test:integration": "vitest run tests/integration"
+    "test:integration": "vitest run tests/integration",
+    "ci:config": "node scripts/ci/check-config.mjs --target production",
+    "ci:config:staging": "node scripts/ci/check-config.mjs --target staging",
+    "ci:migrations": "node scripts/ci/check-migrations.mjs --target production --offline",
+    "ci:health": "node scripts/ci/health-check.mjs",
+    "ci:smoke": "node scripts/ci/smoke-readonly.mjs",
+    "ci:report": "node scripts/ci/report.mjs --dir artifacts"
   },
   "dependencies": {
     "hono": "^4.6.14",

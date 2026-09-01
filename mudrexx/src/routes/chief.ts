@@ -11,6 +11,7 @@ import { PaymentService } from '../services/payment-service';
 import { PackageService } from '../services/package-service';
 import { SettingsService } from '../services/settings-service';
 import { RecoveryService } from '../services/recovery-service';
+import { ChiefSectionsService } from '../services/chief-sections-service';
 import { AiService } from '../services/ai/orchestrator';
 import { WhatsAppService } from '../services/whatsapp/service';
 import { PAYMENT_STATUSES, type PaymentStatus } from '../types';
@@ -30,16 +31,20 @@ chief.use('*', resolveSession, requireAuth, requireRole('SUPER_ADMIN'));
 
 chief.get('/dashboard', async (c) => {
   const container = c.get('container');
-  const [users, admins, payments, activeSessions, recentAudit] = await Promise.all([
+  const sections = new ChiefSectionsService(container);
+  const [users, admins, payments, activeSessions, recentAudit, sectionOverview] = await Promise.all([
     container.users.list({ limit: 1, offset: 0 }),
     container.users.list({ role: 'ADMIN', limit: 5, offset: 0 }),
     container.payments.list({ status: 'ALL', limit: 5, offset: 0 }),
     container.sessions.countActive(),
     container.audit.list({ limit: 10, offset: 0 }),
+    sections.overview(),
   ]);
 
   return ok(c, {
     portal: 'CHIEF_CONTROL',
+    // §23 the Chief Control Portal is split into two parts: RUFLO and MUDREXX.
+    sections: sectionOverview,
     counts: {
       users: users.total,
       admins: admins.total,
@@ -51,6 +56,23 @@ chief.get('/dashboard', async (c) => {
     recentAudit: recentAudit.rows,
   });
 });
+
+/* -------------------------------- sections -------------------------------- */
+/*
+ * §23 The Chief Control Portal has exactly two parts. These routes are mounted
+ * before any `/:id` pattern so a section id can never be swallowed by a
+ * parameterised route (§6, §54).
+ */
+
+chief.get('/sections', (c) => ok(c, new ChiefSectionsService(c.get('container')).list()));
+
+chief.get('/sections/ruflo', async (c) =>
+  ok(c, await new ChiefSectionsService(c.get('container')).ruflo()),
+);
+
+chief.get('/sections/mudrexx', async (c) =>
+  ok(c, await new ChiefSectionsService(c.get('container')).mudrexx()),
+);
 
 /* -------------------------------- admins -------------------------------- */
 

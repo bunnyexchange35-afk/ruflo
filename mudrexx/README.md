@@ -84,6 +84,25 @@ logic never lives in a route handler, and SQL never lives outside a repository.
 `/password-resets` (+`approve`/`reject`), `/settings`, `/recovery/mint`,
 `/recovery/rotate`, `/ai/providers`, `/whatsapp/providers`.
 
+#### Two parts: RUFLO + MUDREXX
+
+The Chief Control Portal is split into two clearly separated parts so the Super
+Admin always knows which system they are looking at:
+
+| Part | Covers | Endpoint |
+|---|---|---|
+| **RUFLO** | AI / agent orchestration — LLM providers, conversations, messages, skill catalogue, agent tool approvals (§30), token + cost usage | `GET /api/chief/sections/ruflo` |
+| **MUDREXX** | Business platform — users, admins, payments, packages, security, and the CRM (contacts, leads, tasks, campaigns, messaging) | `GET /api/chief/sections/mudrexx` |
+
+`GET /api/chief/sections` lists both parts, and `GET /api/chief/dashboard`
+embeds both under a `sections` key (the pre-existing dashboard fields are
+unchanged).
+
+Every figure in both parts is a `COUNT` over a real table — nothing is
+estimated or fabricated (§1). LLM providers are reported as
+`{ name, configured }` only; an API key is never returned (§45). Both routes
+sit behind the same `SUPER_ADMIN` gate as the rest of `/api/chief/*`.
+
 ### Domain
 `/api/crm/*` (contacts, import, lists, leads, routing), `/api/destinations/*`
 (Telegram/webhook + routing rules), `/api/tasks/*` (+`bulk/plan`,
@@ -176,6 +195,21 @@ After deploy, as Chief: `POST /api/ai/skills/seed`, then `POST /api/auth/demo`.
 
 > **Destructive migrations:** `scripts/seed.mjs` and the npm scripts only apply
 > additive migrations. Nothing here drops tables or deletes users (§58).
+
+### Automatic deployment
+
+Pushes to `main` deploy to Cloudflare automatically through
+`.github/workflows/mudrexx-deploy.yml`:
+
+```
+BUILD → TYPECHECK → TEST → DATABASE/SCHEMA CHECK → CLOUDFLARE DEPLOY
+      → HEALTH CHECK → READ-ONLY SMOKE TEST → DEPLOYMENT RESULT
+```
+
+Feature branches and pull requests run build + test only. See
+**[DEPLOYMENT.md](./DEPLOYMENT.md)** for the required GitHub secrets, the
+development/staging/production separation, the migration safety gate and the
+rollback procedure.
 
 ---
 
